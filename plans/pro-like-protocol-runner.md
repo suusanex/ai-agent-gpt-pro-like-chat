@@ -74,7 +74,7 @@ flowchart TD
 - 出力: 最終テキスト、harness 名、model 名、session 識別子、診断情報
 - 共有しないもの: 他役割の transcript、前の質問の memory、ツールによるファイル変更
 
-analyst は同じ質問を並列の別プロセスで処理する。人数、agent、model は設定値にし、コードに固定しない。初回の実験設定は `github-copilot` の3本に固定する。model は3本とも設定に書く。Cursor、Grok、Codex を混ぜる比較は、その有効性を見たあとの設定変更であり、初回設定には入れない。各呼び出しは、このリポジトリの外に作る空 directory を `working_directory` にし、`skills` と `session_id` は渡さない。コーディング CLI がその directory を変更した場合は成果物として残す。実験設定では `model`、`timeout_seconds`、`auto_approve` を必ず書く。
+analyst は同じ質問を並列の別プロセスで処理する。人数、agent、model は設定値にし、コードに固定しない。初回の実験設定は `github-copilot` の3本に固定する。model は3本とも設定に書く。Cursor、Grok、Codex を混ぜる比較は、その有効性を見たあとの設定変更であり、初回設定には入れない。各呼び出しは、このリポジトリの外に作る、その呼び出し専用の空 directory を `working_directory` にする。出力先の末尾名が同じ別 run や、前回の後段再実行とは作業場所を共有しない。過去の作業 directory は残し、次の呼び出しの入力にはしない。`skills` と `session_id` は渡さない。コーディング CLI がその directory を変更した場合は成果物として残す。実験設定では `model`、`timeout_seconds`、`auto_approve` を必ず書く。
 
 並列 analyst の1本が失敗したときは、残りの Facade CLI プロセスを直ちに Kill し、disagreement 以降を始めない。Kill されたプロセスは標準出力の JSON を出さないことがある。これは [docs/cli.md](https://github.com/suusanex/codex_agent_facade/blob/main/docs/cli.md) の強制終了時の契約である。実行役は、最初の失敗の JSON または終了コード、Kill したプロセス、JSON が無いことは強制終了の結果であること、をトレースログへ残す。Kill した側の完了は待たない。analyst より後の段は1本ずつ実行する。
 

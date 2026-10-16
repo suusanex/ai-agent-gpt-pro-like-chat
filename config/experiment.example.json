@@ -1,0 +1,61 @@
+{
+  "facadeCliPath": "D:\\Tools\\Development\\CodexAgentFacade\\CodexAgentFacadeCli.exe",
+  "promptsDirectory": "../prompts",
+  "includeAnalystTextsInSynthesizer": false,
+  "analysts": [
+    {
+      "agent": "github-copilot",
+      "model": "gpt-5-mini",
+      "timeoutSeconds": 1200,
+      "autoApprove": false
+    },
+    {
+      "agent": "github-copilot",
+      "model": "gpt-5-mini",
+      "timeoutSeconds": 1200,
+      "autoApprove": false
+    },
+    {
+      "agent": "github-copilot",
+      "model": "gpt-5-mini",
+      "timeoutSeconds": 1200,
+      "autoApprove": false
+    }
+  ],
+  "disagreement": {
+    "agent": "github-copilot",
+    "model": "gpt-5-mini",
+    "timeoutSeconds": 1200,
+    "autoApprove": false
+  },
+  "critic": {
+    "agent": "github-copilot",
+    "model": "gpt-5-mini",
+    "timeoutSeconds": 1200,
+    "autoApprove": false
+  },
+  "arbiter": {
+    "agent": "github-copilot",
+    "model": "gpt-5-mini",
+    "timeoutSeconds": 1200,
+    "autoApprove": false
+  },
+  "adjudicator": {
+    "agent": "github-copilot",
+    "model": "gpt-5-mini",
+    "timeoutSeconds": 1200,
+    "autoApprove": false
+  },
+  "synthesizer": {
+    "agent": "github-copilot",
+    "model": "gpt-5-mini",
+    "timeoutSeconds": 1200,
+    "autoApprove": false
+  },
+  "baseline": {
+    "agent": "github-copilot",
+    "model": "gpt-5-mini",
+    "timeoutSeconds": 1200,
+    "autoApprove": false
+  }
+}
