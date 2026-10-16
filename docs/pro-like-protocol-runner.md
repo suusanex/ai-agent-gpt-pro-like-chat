@@ -13,7 +13,7 @@ dotnet run --file src/ProLikeRunner.cs -- continue --run-dir D:\temp\pro-like-ru
 
 `--downstream` は `pro-like`、`fable-like`、`both` のいずれかである。`run` は前段を1回実行し、同じ成果物から `final-pro-like.md` と `final-fable-like.md` の両方を書く。`baseline` はその前段を使わない1回の質問である。`continue` は保存済みの前段を再実行しない。
 
-終了コードは、成功が 0、実行の失敗が 1、引数不足が 2 である。
+終了コードは、成功が 0、実行の失敗が 1、引数不足・未知のコマンド・未知のオプションが 2 である。Ctrl+C は起動中の Facade CLI を止めてから runner が戻る。同じ run directory を同時に実行した場合は、後から開始した側を失敗させる。
 
 ## Facade CLI の呼び方
 
@@ -21,7 +21,9 @@ dotnet run --file src/ProLikeRunner.cs -- continue --run-dir D:\temp\pro-like-ru
 
 送るフィールドは `agent`、`prompt`、`working_directory`、`model`、`timeout_seconds`、`auto_approve` である。設定にあるときだけ `reasoning_effort` と `fast` を足す。`session_id`、`request_id`、`skills` は送らない。
 
-成功はプロセス終了コード 0 かつ `status=completed` で、`result.outputText` が空でないことである。`outputKind` が `assistant_transcript` でも本文は採用する。それ以外は、その役割の失敗として実行全体を止める。`failure.kind` と `failure.summary` は trace へ残す。
+成功はプロセス終了コード 0 かつ `status=completed` で、`result.outputText` が空でないことである。`outputKind` が `assistant_transcript` でも本文は採用する。それ以外は、その役割の失敗として実行全体を止める。`failure.kind` と `failure.summary`、および stderr は trace へ残す。起動失敗の診断は stderr にしか無いため、バイト数だけにはしない。実行中の例外は、その run の trace を閉じる前に `Exception.ToString()` を書く。
+
+再実行する役割は、成功するまで `result.json`、`output.md`、公開する成果物を残さない。`fable-like` は adjudicator を始める時点で、前回の `final-fable-like.md` も消す。失敗した試みの prompt と request は、その役割の directory に残る。
 
 `working_directory` はリポジトリの外に、呼び出しごとに新しい空 directory として作る。既定の場所は `%LOCALAPPDATA%\ai-agent-gpt-pro-like-chat\work\<run-key>\<role>\<invocation>` である。`run-key` は出力先 directory の完全パスから作り、末尾の名前が同じ別 run とは共有しない。`invocation` は呼び出しごとの識別子であり、`continue` で同じ役割を再実行しても前回の作業ファイルは引き継がない。過去の作業 directory は記録として残し、実行後に削除しない。役割の `result.json` に今回の path と、作られたファイルの相対 path を残す。
 

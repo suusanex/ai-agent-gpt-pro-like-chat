@@ -15,6 +15,19 @@ internal static class App
 {
     public static async Task<int> RunAsync(string[] args)
     {
+        using var cancellation = new CancellationTokenSource();
+        ConsoleCancelEventHandler onCancel = (_, eventArgs) =>
+        {
+            // 2回目の Ctrl+C はプロセスを終わらせる。1回目は子プロセスの停止を待つ。
+            if (cancellation.IsCancellationRequested)
+            {
+                return;
+            }
+
+            eventArgs.Cancel = true;
+            cancellation.Cancel();
+        };
+        Console.CancelKeyPress += onCancel;
         try
         {
             if (args.Length == 0)
@@ -26,11 +39,18 @@ internal static class App
             return args[0] switch
             {
                 "self-test" => await SelfTest.RunAsync(),
-                "run" => await RunComparisonCommandAsync(ParseFlags(args, 1)),
-                "baseline" => await RunBaselineCommandAsync(ParseFlags(args, 1)),
-                "continue" => await ContinueCommandAsync(ParseFlags(args, 1)),
+                "run" => await RunComparisonCommandAsync(ParseFlags(args, 1), cancellation.Token),
+                "baseline" => await RunBaselineCommandAsync(ParseFlags(args, 1), cancellation.Token),
+                "continue" => await ContinueCommandAsync(ParseFlags(args, 1), cancellation.Token),
                 _ => UnknownCommand(args[0]),
             };
+        }
+        catch (CommandLineException ex)
+        {
+            Trace.TraceError(ex.ToString());
+            Console.Error.WriteLine(ex.Message);
+            Console.Error.WriteLine(Usage);
+            return 2;
         }
         catch (Exception ex)
         {
@@ -38,33 +58,37 @@ internal static class App
             Console.Error.WriteLine(ex.ToString());
             return 1;
         }
+        finally
+        {
+            Console.CancelKeyPress -= onCancel;
+        }
     }
 
-    private static async Task<int> RunComparisonCommandAsync(Dictionary<string, string> flags)
+    private static async Task<int> RunComparisonCommandAsync(Dictionary<string, string> flags, CancellationToken cancellationToken)
     {
         var loaded = ConfigLoader.Load(Require(flags, "config"), requireComparison: true, requireBaseline: false);
         var question = ReadQuestion(Require(flags, "question"));
         var runDirectory = Path.GetFullPath(Require(flags, "out"));
         RejectUnknown(flags, "config", "question", "out");
         var runner = new ProtocolRunner(new FacadeCliRoleExecutor(loaded.Config.FacadeCliPath), DefaultWorkRoot);
-        await runner.RunComparisonAsync(loaded.Config, question, runDirectory, CancellationToken.None);
+        await runner.RunComparisonAsync(loaded.Config, question, runDirectory, cancellationToken);
         Console.WriteLine(runDirectory);
         return 0;
     }
 
-    private static async Task<int> RunBaselineCommandAsync(Dictionary<string, string> flags)
+    private static async Task<int> RunBaselineCommandAsync(Dictionary<string, string> flags, CancellationToken cancellationToken)
     {
         var loaded = ConfigLoader.Load(Require(flags, "config"), requireComparison: false, requireBaseline: true);
         var question = ReadQuestion(Require(flags, "question"));
         var runDirectory = Path.GetFullPath(Require(flags, "out"));
         RejectUnknown(flags, "config", "question", "out");
         var runner = new ProtocolRunner(new FacadeCliRoleExecutor(loaded.Config.FacadeCliPath), DefaultWorkRoot);
-        await runner.RunBaselineAsync(loaded.Config, question, runDirectory, CancellationToken.None);
+        await runner.RunBaselineAsync(loaded.Config, question, runDirectory, cancellationToken);
         Console.WriteLine(runDirectory);
         return 0;
     }
 
-    private static async Task<int> ContinueCommandAsync(Dictionary<string, string> flags)
+    private static async Task<int> ContinueCommandAsync(Dictionary<string, string> flags, CancellationToken cancellationToken)
     {
         var runDirectory = Path.GetFullPath(Require(flags, "run-dir"));
         var downstream = Require(flags, "downstream");
@@ -73,7 +97,7 @@ internal static class App
         var loaded = ConfigLoader.Load(snapshotPath, requireComparison: false, requireBaseline: false);
         ConfigLoader.RequireDownstream(loaded.Config, downstream);
         var runner = new ProtocolRunner(new FacadeCliRoleExecutor(loaded.Config.FacadeCliPath), DefaultWorkRoot);
-        await runner.ContinueAsync(loaded.Config, runDirectory, downstream, CancellationToken.None);
+        await runner.ContinueAsync(loaded.Config, runDirectory, downstream, cancellationToken);
         Console.WriteLine(runDirectory);
         return 0;
     }
@@ -114,18 +138,18 @@ internal static class App
             var token = args[i];
             if (!token.StartsWith("--", StringComparison.Ordinal) || token.Length < 3)
             {
-                throw new ProtocolException($"Unexpected argument '{token}'.");
+                throw new CommandLineException($"Unexpected argument '{token}'.");
             }
 
             var key = token[2..];
             if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
             {
-                throw new ProtocolException($"Missing value for --{key}.");
+                throw new CommandLineException($"Missing value for --{key}.");
             }
 
             if (!result.TryAdd(key, args[++i]))
             {
-                throw new ProtocolException($"Duplicate option --{key}.");
+                throw new CommandLineException($"Duplicate option --{key}.");
             }
         }
 
@@ -136,7 +160,7 @@ internal static class App
     {
         if (!flags.TryGetValue(name, out var value) || string.IsNullOrWhiteSpace(value))
         {
-            throw new ProtocolException($"Option --{name} is required.");
+            throw new CommandLineException($"Option --{name} is required.");
         }
 
         return value;
@@ -149,7 +173,7 @@ internal static class App
         {
             if (!allowedSet.Contains(key))
             {
-                throw new ProtocolException($"Unknown option --{key}.");
+                throw new CommandLineException($"Unknown option --{key}.");
             }
         }
     }
@@ -699,11 +723,10 @@ internal sealed class FacadeCliRoleExecutor : IRoleExecutor
         using var registration = linked.Token.Register(() => ProcessControl.KillTree(process));
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();
-        await process.StandardInput.WriteAsync(json.AsMemory(), CancellationToken.None);
-        process.StandardInput.Close();
-
         try
         {
+            await process.StandardInput.WriteAsync(json.AsMemory(), linked.Token);
+            process.StandardInput.Close();
             await process.WaitForExitAsync(linked.Token);
         }
         catch (OperationCanceledException ex)
@@ -725,9 +748,10 @@ internal sealed class FacadeCliRoleExecutor : IRoleExecutor
 
         var stdout = await stdoutTask;
         var stderr = await stderrTask;
-        if (!string.IsNullOrWhiteSpace(stderr))
+        // 起動失敗の診断は stdout の JSON が無く、stderr にしか残らない契約である。
+        if (stderr.Length > 0)
         {
-            Trace.TraceInformation("Facade CLI stderr bytes=" + Encoding.UTF8.GetByteCount(stderr).ToString(CultureInfo.InvariantCulture));
+            Trace.TraceError("Facade CLI stderr:\n" + stderr);
         }
 
         return FacadeRequests.ParseStdout(stdout, process.ExitCode);
@@ -773,8 +797,11 @@ internal sealed class ProtocolRunner
         CancellationToken cancellationToken)
     {
         runDirectory = Path.GetFullPath(runDirectory);
+        using var runLock = RunLock.Acquire(runDirectory);
         PrepareNewRun(config, question, runDirectory);
         using var trace = TraceScope.Start(Path.Combine(runDirectory, RunFiles.Trace));
+        try
+        {
         var analysts = await RunAnalystsAsync(config, question, runDirectory, cancellationToken);
         var disagreement = await RunSingleAsync(
             config.Disagreement!,
@@ -802,6 +829,12 @@ internal sealed class ProtocolRunner
 
         await RunProLikeAsync(config, question, analysts, disagreement, critic, runDirectory, cancellationToken);
         await RunFableLikeAsync(config, question, analysts, disagreement, critic, runDirectory, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Trace.TraceError(ex.ToString());
+            throw;
+        }
     }
 
     public async Task RunBaselineAsync(
@@ -811,15 +844,24 @@ internal sealed class ProtocolRunner
         CancellationToken cancellationToken)
     {
         runDirectory = Path.GetFullPath(runDirectory);
+        using var runLock = RunLock.Acquire(runDirectory);
         PrepareNewRun(config, question, runDirectory);
         using var trace = TraceScope.Start(Path.Combine(runDirectory, RunFiles.Trace));
-        await RunSingleAsync(
-            config.Baseline!,
-            "baseline",
-            PromptComposer.Baseline(question),
-            runDirectory,
-            RunFiles.FinalBaseline,
-            cancellationToken);
+        try
+        {
+            await RunSingleAsync(
+                config.Baseline!,
+                "baseline",
+                PromptComposer.Baseline(question),
+                runDirectory,
+                RunFiles.FinalBaseline,
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Trace.TraceError(ex.ToString());
+            throw;
+        }
     }
 
     public async Task ContinueAsync(
@@ -834,7 +876,10 @@ internal sealed class ProtocolRunner
             throw new ProtocolException($"Run directory was not found: {runDirectory}");
         }
 
+        using var runLock = RunLock.Acquire(runDirectory);
         using var trace = TraceScope.Start(Path.Combine(runDirectory, RunFiles.Trace));
+        try
+        {
         var question = ReadRequired(Path.Combine(runDirectory, RunFiles.Question));
         var analysts = ReadAnalysts(runDirectory, config.Analysts.Count);
         var disagreement = ReadRequired(Path.Combine(runDirectory, RunFiles.Disagreement));
@@ -859,6 +904,12 @@ internal sealed class ProtocolRunner
         {
             await RunFableLikeAsync(config, question, analysts, disagreement, critic, runDirectory, cancellationToken);
         }
+        }
+        catch (Exception ex)
+        {
+            Trace.TraceError(ex.ToString());
+            throw;
+        }
     }
 
     private async Task RunProLikeAsync(
@@ -870,6 +921,7 @@ internal sealed class ProtocolRunner
         string runDirectory,
         CancellationToken cancellationToken)
     {
+        InvalidateRole(runDirectory, "arbiter", RunFiles.FinalProLike);
         await RunSingleAsync(
             config.Arbiter!,
             "arbiter",
@@ -888,6 +940,8 @@ internal sealed class ProtocolRunner
         string runDirectory,
         CancellationToken cancellationToken)
     {
+        InvalidateRole(runDirectory, "adjudicator", RunFiles.Adjudication);
+        InvalidateRole(runDirectory, "synthesizer", RunFiles.FinalFableLike);
         var adjudication = await RunSingleAsync(
             config.Adjudicator!,
             "adjudicator",
@@ -1005,6 +1059,12 @@ internal sealed class ProtocolRunner
         Directory.CreateDirectory(roleDirectory);
         WriteText(Path.Combine(roleDirectory, "prompt.md"), prompt);
         WriteText(Path.Combine(roleDirectory, "request.json"), FacadeRequests.BuildJson(request));
+        var published = Path.IsPathRooted(publishedRelativePath)
+            ? publishedRelativePath
+            : Path.Combine(runDirectory, publishedRelativePath);
+        DeleteIfExists(Path.Combine(roleDirectory, "result.json"));
+        DeleteIfExists(Path.Combine(roleDirectory, "output.md"));
+        DeleteIfExists(published);
         var execution = await _executor.ExecuteAsync(request, cancellationToken);
         var entries = ListWorkEntries(workDirectory);
         var result = new RoleResultRecord
@@ -1023,9 +1083,6 @@ internal sealed class ProtocolRunner
         };
         WriteText(Path.Combine(roleDirectory, "result.json"), JsonSerializer.Serialize(result, AppJsonContext.Default.RoleResultRecord));
         WriteText(Path.Combine(roleDirectory, "output.md"), execution.OutputText);
-        var published = Path.IsPathRooted(publishedRelativePath)
-            ? publishedRelativePath
-            : Path.Combine(runDirectory, publishedRelativePath);
         WriteText(published, execution.OutputText);
         return execution.OutputText;
     }
@@ -1066,7 +1123,7 @@ internal sealed class ProtocolRunner
 
     private static void PrepareNewRun(ExperimentConfig config, string question, string runDirectory)
     {
-        if (Directory.Exists(runDirectory) && Directory.EnumerateFileSystemEntries(runDirectory).Any())
+        if (Directory.Exists(runDirectory) && Directory.EnumerateFileSystemEntries(runDirectory).Any(path => !IsRunLock(path)))
         {
             throw new ProtocolException($"Run directory is not empty: {runDirectory}");
         }
@@ -1162,6 +1219,27 @@ internal sealed class ProtocolRunner
 
         File.WriteAllText(path, text, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
     }
+
+    private static void DeleteIfExists(string path)
+    {
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+        }
+    }
+
+    private static void InvalidateRole(string runDirectory, string roleName, string publishedRelativePath)
+    {
+        var roleDirectory = Path.Combine(runDirectory, "roles", roleName);
+        DeleteIfExists(Path.Combine(roleDirectory, "result.json"));
+        DeleteIfExists(Path.Combine(roleDirectory, "output.md"));
+        DeleteIfExists(Path.Combine(runDirectory, publishedRelativePath));
+    }
+
+    private static bool IsRunLock(string path)
+    {
+        return string.Equals(Path.GetFileName(path), ".run.lock", StringComparison.OrdinalIgnoreCase);
+    }
 }
 
 internal sealed class TraceScope : IDisposable
@@ -1231,6 +1309,8 @@ internal static class SelfTest
         await CheckAsync(failures, "prompts", PromptTests);
         await CheckAsync(failures, "config", ConfigTests);
         await CheckAsync(failures, "comparison", ComparisonTests);
+        await CheckAsync(failures, "command-line", CommandLineTests);
+        await CheckAsync(failures, "facade-diagnostics", FacadeDiagnosticTests);
         await CheckAsync(failures, "kill", () =>
         {
             ProcessControlTests.KillSleepProcess();
@@ -1396,6 +1476,58 @@ internal static class SelfTest
         return Task.CompletedTask;
     }
 
+    private static async Task CommandLineTests()
+    {
+        Assert(await App.RunAsync(["run"]) == 2, "missing run options");
+        Assert(await App.RunAsync(["run", "--config"]) == 2, "missing option value");
+        Assert(await App.RunAsync(["run", "--config", "missing.json", "--question", "q.md", "--out", "out"]) == 1, "missing config is a run failure");
+    }
+
+    private static async Task FacadeDiagnosticTests()
+    {
+        var root = CreateFixture();
+        try
+        {
+            var failing = Path.Combine(root, "fail.cmd");
+            File.WriteAllText(failing, "@echo off\r\necho startup-diagnostic 1>&2\r\nexit /b 1\r\n");
+            var tracePath = Path.Combine(root, "trace.log");
+            var work = Path.Combine(root, "work");
+            Directory.CreateDirectory(work);
+            var request = new RoleExecutionRequest("baseline", "github-copilot", "prompt", work, "gpt-5-mini", null, null, 30, false);
+            using (TraceScope.Start(tracePath))
+            {
+                await AssertThrowsAsync(() => new FacadeCliRoleExecutor(failing).ExecuteAsync(request, CancellationToken.None));
+            }
+
+            Assert(File.ReadAllText(tracePath).Contains("startup-diagnostic", StringComparison.Ordinal), "stderr is traced before stdout parsing");
+
+            var hanging = Path.Combine(root, "hang.cmd");
+            File.WriteAllText(hanging, "@echo off\r\nping -n 30 127.0.0.1 >nul\r\n");
+            using var cancellation = new CancellationTokenSource();
+            var hangingRequest = request with { WorkingDirectory = Path.Combine(root, "hang-work"), TimeoutSeconds = 60 };
+            Directory.CreateDirectory(hangingRequest.WorkingDirectory);
+            var running = new FacadeCliRoleExecutor(hanging).ExecuteAsync(hangingRequest, cancellation.Token);
+            await Task.Delay(300);
+            cancellation.Cancel();
+            var started = DateTime.UtcNow;
+            try
+            {
+                await running;
+                throw new ProtocolException("Cancellation did not stop the Facade process.");
+            }
+            catch (OperationCanceledException ex)
+            {
+                Trace.TraceError(ex.ToString());
+            }
+
+            Assert(DateTime.UtcNow - started < TimeSpan.FromSeconds(10), "cancelled Facade process exits");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static async Task ComparisonTests()
     {
         var root = CreateFixture();
@@ -1433,8 +1565,10 @@ internal static class SelfTest
 
             var badExecutor = new ScriptedRoleExecutor { Disagreement = "no marker" };
             var badRunner = new ProtocolRunner(badExecutor, Path.Combine(root, "work-bad"));
-            await AssertThrowsAsync(() => badRunner.RunComparisonAsync(config, "QUESTION", Path.Combine(root, "run-bad"), CancellationToken.None));
+            var badDirectory = Path.Combine(root, "run-bad");
+            await AssertThrowsAsync(() => badRunner.RunComparisonAsync(config, "QUESTION", badDirectory, CancellationToken.None));
             Assert(!badExecutor.Calls.Any(call => call.RoleName == "critic"), "bad marker stops critic");
+            Assert(File.ReadAllText(Path.Combine(badDirectory, RunFiles.Trace)).Contains("DISAGREEMENT: present", StringComparison.Ordinal), "failure stays in trace");
 
             var failing = new ScriptedRoleExecutor { FailAnalyst = 2 };
             var failingRunner = new ProtocolRunner(failing, Path.Combine(root, "work-fail"));
@@ -1463,6 +1597,32 @@ internal static class SelfTest
             Assert(continueExecutor.Calls.All(call => call.RoleName is "arbiter" or "adjudicator" or "synthesizer"), "continue downstream only");
             Assert(continueExecutor.Calls.All(call => !executor.Calls.Any(previous => previous.WorkingDirectory == call.WorkingDirectory)), "continue uses a new work directory");
             Assert(continueExecutor.Calls.All(call => !File.Exists(Path.Combine(call.WorkingDirectory, "leftover.txt"))), "continue does not inherit leftover");
+
+            var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var lockingExecutor = new ScriptedRoleExecutor
+            {
+                RejectUpstream = true,
+                Hold = hold,
+                EnteredHold = entered,
+                HoldRole = "arbiter",
+            };
+            var lockingRun = new ProtocolRunner(lockingExecutor, sharedWork).ContinueAsync(config, runDirectory, "pro-like", CancellationToken.None);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var blocked = new ScriptedRoleExecutor { RejectUpstream = true };
+            await AssertThrowsAsync(() => new ProtocolRunner(blocked, sharedWork).ContinueAsync(config, runDirectory, "pro-like", CancellationToken.None));
+            Assert(blocked.Calls.Count == 0, "locked run does not start a role");
+            hold.TrySetResult();
+            await lockingRun;
+
+            var staleFinal = Path.Combine(runDirectory, RunFiles.FinalFableLike);
+            Assert(File.Exists(staleFinal), "successful fable final exists before failed retry");
+            var failingSynthesizer = new ScriptedRoleExecutor { RejectUpstream = true, FailRole = "synthesizer" };
+            await AssertThrowsAsync(() => new ProtocolRunner(failingSynthesizer, Path.Combine(root, "work-fail-synth")).ContinueAsync(config, runDirectory, "fable-like", CancellationToken.None));
+            Assert(!File.Exists(staleFinal), "failed synthesizer removes the previous final");
+            Assert(File.ReadAllText(Path.Combine(runDirectory, RunFiles.Adjudication)).Contains("adjudicator-output", StringComparison.Ordinal), "new adjudication remains");
+            Assert(!File.Exists(Path.Combine(runDirectory, "roles", "synthesizer", "result.json")), "failed synthesizer has no result");
+            Assert(File.Exists(Path.Combine(runDirectory, "roles", "synthesizer", "prompt.md")), "failed attempt keeps its prompt");
         }
         finally
         {
@@ -1547,6 +1707,14 @@ internal sealed class ScriptedRoleExecutor : IRoleExecutor
 
     public int? FailAnalyst { get; set; }
 
+    public string? FailRole { get; set; }
+
+    public string? HoldRole { get; set; }
+
+    public TaskCompletionSource? Hold { get; set; }
+
+    public TaskCompletionSource? EnteredHold { get; set; }
+
     public bool RejectUpstream { get; set; }
 
     public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1566,6 +1734,17 @@ internal sealed class ScriptedRoleExecutor : IRoleExecutor
         if (RejectUpstream && request.RoleName is not ("arbiter" or "adjudicator" or "synthesizer"))
         {
             throw new ProtocolException("Upstream role was called during continue: " + request.RoleName);
+        }
+
+        if (Hold is not null && request.RoleName == HoldRole)
+        {
+            EnteredHold?.TrySetResult();
+            await Hold.Task.WaitAsync(cancellationToken);
+        }
+
+        if (FailRole == request.RoleName)
+        {
+            throw new ProtocolException(request.RoleName + " failed");
         }
 
         if (FailAnalyst is int failed && request.RoleName == "analyst-" + failed.ToString(CultureInfo.InvariantCulture))
@@ -1591,6 +1770,48 @@ internal sealed class ScriptedRoleExecutor : IRoleExecutor
 
         var text = request.RoleName == "disagreement" ? Disagreement : request.RoleName + "-output";
         return new RoleExecution(text, "session", "final_response", "run", 0, null, null);
+    }
+}
+
+internal sealed class CommandLineException : Exception
+{
+    public CommandLineException(string message)
+        : base(message)
+    {
+    }
+}
+
+internal sealed class RunLock : IDisposable
+{
+    private readonly FileStream _stream;
+
+    private RunLock(FileStream stream)
+    {
+        _stream = stream;
+    }
+
+    public static RunLock Acquire(string runDirectory)
+    {
+        Directory.CreateDirectory(runDirectory);
+        try
+        {
+            var stream = new FileStream(
+                Path.Combine(runDirectory, ".run.lock"),
+                FileMode.OpenOrCreate,
+                FileAccess.ReadWrite,
+                FileShare.None);
+            return new RunLock(stream);
+        }
+        catch (IOException ex)
+        {
+            Trace.TraceError(ex.ToString());
+            throw new ProtocolException($"Run directory is already in use: {runDirectory}", ex);
+        }
+    }
+
+    public void Dispose()
+    {
+        _stream.Dispose();
     }
 }
 
